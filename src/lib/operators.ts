@@ -40,6 +40,7 @@ export const OPS = {
   setLeadingMoveText: 41,
   setTextMatrix: 42,
   nextLine: 43,
+  setTextRenderingMode: 38,
   showText: 44,
   showSpacedText: 45,
   nextLineShowText: 46,
@@ -102,6 +103,14 @@ export interface TextPaint {
   text: string;
   x: number;
   y: number;
+  /** Width of the run in page units. */
+  width: number;
+  /** Font size in page units, after the text matrix and the CTM. */
+  fontSize: number;
+  /** Fill luminance while the text was shown. Null when the fill is transparent. */
+  luminance: number | null;
+  /** PDF text rendering mode. 3 is invisible. */
+  renderMode: number;
 }
 
 interface GState {
@@ -116,6 +125,7 @@ interface GState {
   charSpacing: number;
   wordSpacing: number;
   textRise: number;
+  renderMode: number;
   fillSpace: "gray" | "rgb" | "cmyk" | "other";
 }
 
@@ -142,6 +152,7 @@ function initialState(): GState {
     charSpacing: 0,
     wordSpacing: 0,
     textRise: 0,
+    renderMode: 0,
     fillSpace: "gray",
   };
 }
@@ -358,7 +369,7 @@ function glyphsText(glyphs: unknown): { text: string; glyphs: unknown[] } {
   return { text, glyphs: list };
 }
 
-function advanceText(state: GState, glyphs: unknown[]) {
+function textWidth(state: GState, glyphs: unknown[]): number {
   let width = 0;
   for (const g of glyphs) {
     if (typeof g === "number") {
@@ -371,8 +382,20 @@ function advanceText(state: GState, glyphs: unknown[]) {
       width += (gw / 1000) * state.fontSize * state.hScale + state.charSpacing + (space ? state.wordSpacing : 0);
     }
   }
+  return width;
+}
+
+function advanceText(state: GState, glyphs: unknown[]) {
+  const width = textWidth(state, glyphs);
   const m = state.textMatrix;
   state.textMatrix = [m[0], m[1], m[2], m[3], m[0] * width + m[4], m[1] * width + m[5]];
+}
+
+/** Font size in page user space. */
+function effectiveFontSize(state: GState): number {
+  const textScale = Math.hypot(state.textMatrix[0], state.textMatrix[1]) || 1;
+  const ctmScale = Math.hypot(state.ctm[0], state.ctm[1]) || 1;
+  return state.fontSize * textScale * ctmScale;
 }
 
 function translateLine(state: GState, tx: number, ty: number) {
@@ -447,7 +470,16 @@ export function walkOperatorList(opList: { fnArray: ArrayLike<number>; argsArray
     const { text, glyphs } = glyphsText(args[0]);
     if (text) {
       const origin = textOrigin(state);
-      textPaints.push({ paintIndex, text, x: origin.x, y: origin.y });
+      textPaints.push({
+        paintIndex,
+        text,
+        x: origin.x,
+        y: origin.y,
+        width: textWidth(state, glyphs),
+        fontSize: effectiveFontSize(state),
+        luminance: state.fill ? luminance(state.fill.r, state.fill.g, state.fill.b) : null,
+        renderMode: state.renderMode,
+      });
     }
     advanceText(state, glyphs);
   };
@@ -571,6 +603,9 @@ export function walkOperatorList(opList: { fnArray: ArrayLike<number>; argsArray
         break;
       case OPS.setFont:
         if (typeof args[1] === "number") state.fontSize = args[1];
+        break;
+      case OPS.setTextRenderingMode:
+        state.renderMode = num(args[0]);
         break;
       case OPS.setTextMatrix: {
         const m = readMatrix(args);

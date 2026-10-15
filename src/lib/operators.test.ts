@@ -106,7 +106,16 @@ describe("walkOperatorList", () => {
       [OPS.beginText, OPS.setTextMatrix, OPS.showText, OPS.endText, OPS.constructPath],
       [[], [[1, 0, 0, 1, 12, 40]], [glyphs], [], [OPS.fill, [buf], null]],
     );
-    expect(walked.textPaints).toEqual([{ paintIndex: 2, text: "SE", x: 12, y: 40 }]);
+    expect(walked.textPaints).toEqual([{
+      paintIndex: 2,
+      text: "SE",
+      x: 12,
+      y: 40,
+      width: 1,
+      fontSize: 1,
+      luminance: 0,
+      renderMode: 0,
+    }]);
     expect(walked.covers[0].paintIndex).toBeGreaterThan(walked.textPaints[0].paintIndex);
   });
 
@@ -121,21 +130,21 @@ describe("walkOperatorList", () => {
 });
 
 describe("matchPaintIndices", () => {
+  const event = (paintIndex: number, text: string) => ({
+    paintIndex,
+    text,
+    x: 0,
+    y: 0,
+    width: 10,
+    fontSize: 12,
+    luminance: 0,
+    renderMode: 0,
+  });
+
   it("zips equal runs and shares an index when one showText is split", () => {
-    const events = [
-      { paintIndex: 4, text: "Hello", x: 0, y: 0 },
-      { paintIndex: 9, text: "World", x: 0, y: 0 },
-    ];
-    expect(matchPaintIndices(["Hello", "World"], events)).toEqual([4, 9]);
-    expect(matchPaintIndices(["Hel", "lo"], [{ paintIndex: 3, text: "Hello", x: 0, y: 0 }])).toEqual([3, 3]);
-    expect(matchPaintIndices(["Hello"], [{ paintIndex: 1, text: "Nope", x: 0, y: 0 }, { paintIndex: 4, text: "Hello", x: 0, y: 0 }])).toEqual([4]);
-    expect(matchPaintIndices(
-      ["Password: hunter2", "NOTALEAK"],
-      [
-        { paintIndex: 55, text: "Password: ", x: 0, y: 0 },
-        { paintIndex: 65, text: "hunter2", x: 0, y: 0 },
-        { paintIndex: 93, text: "NOTALEAK", x: 0, y: 0 },
-      ],
-    )).toEqual([55, 93]);
+    expect(matchPaintIndices(["Hello", "World"], [event(4, "Hello"), event(9, "World")])).toEqual([4, 9]);
+    expect(matchPaintIndices(["Hel", "lo"], [event(3, "Hello")])).toEqual([3, 3]);
+    expect(matchPaintIndices(["Hello"], [event(1, "Nope"), event(4, "Hello")])).toEqual([4]);
+    expect(matchPaintIndices(["Password: hunter2", "NOTALEAK"], [event(55, "Password: "), event(65, "hunter2"), event(93, "NOTALEAK")])).toEqual([55, 93]);
   });
 });
