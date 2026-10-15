@@ -1,0 +1,8 @@
+node_modules
+dist
+.cache
+coverage
+*.local
+.DS_Store
+tsconfig.tsbuildinfo
+node_modules/.tmp
