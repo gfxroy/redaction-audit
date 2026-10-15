@@ -1,4 +1,6 @@
-import { PDFDocument, PDFName, StandardFonts, degrees, rgb } from "pdf-lib";
+import { PDFArray, PDFDict, PDFDocument, PDFHexString, PDFName, PDFString, StandardFonts, degrees, rgb } from "pdf-lib";
+import { jpegWithGps } from "./exif";
+import { appendRevision } from "./revisions";
 
 export const SECRETS = {
   visible: "Quarterly memo",
@@ -146,4 +148,147 @@ export async function makeCleanPdf(): Promise<Uint8Array> {
   doc.setAuthor("Records");
   stamp(doc);
   return doc.save({ useObjectStreams: false });
+}
+
+/**
+ * A sample that trips the privacy check: hidden text, a real redaction,
+ * personal details, an attachment, a script, a signature, and an older save.
+ */
+export async function makePrivacyPdf(): Promise<Uint8Array> {
+  const doc = await PDFDocument.create({ updateMetadata: false });
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const page = doc.addPage([612, 792]);
+
+  page.drawText("Quarterly memo", { x: 72, y: 740, size: 16, font, color: rgb(0, 0, 0) });
+  const secret = "SSN 123-45-6789";
+  const secretW = font.widthOfTextAtSize(secret, 14);
+  page.drawText(secret, { x: 72, y: 680, size: 14, font, color: rgb(0, 0, 0) });
+  page.drawRectangle({ x: 69, y: 676, width: secretW + 8, height: 20, color: rgb(0, 0, 0) });
+
+  page.drawText("ada@example.com", { x: 72, y: 640, size: 12, font, color: rgb(0, 0, 0) });
+  page.drawText("4111 1111 1111 1111", { x: 72, y: 610, size: 12, font, color: rgb(0, 0, 0) });
+  page.drawText("GB82 WEST 1234 5698 7654 32", { x: 72, y: 580, size: 12, font, color: rgb(0, 0, 0) });
+  page.drawText("2345 6789 0123", { x: 72, y: 550, size: 12, font, color: rgb(0, 0, 0) });
+  page.drawText("ABCDE1234F", { x: 72, y: 520, size: 12, font, color: rgb(0, 0, 0) });
+  page.drawText("hidden white words", { x: 72, y: 480, size: 12, font, color: rgb(1, 1, 1) });
+  page.drawText("tiny secret", { x: 72, y: 450, size: 1, font, color: rgb(0, 0, 0) });
+  page.drawText("off the page", { x: 900, y: 80, size: 12, font, color: rgb(0, 0, 0) });
+
+  const image = await doc.embedJpg(jpegWithGps());
+  page.drawImage(image, { x: 430, y: 180, width: 36, height: 36 });
+
+  const form = doc.getForm();
+  const name = form.createTextField("Name");
+  name.setText("Ada Lovelace");
+  name.addToPage(page, { x: 72, y: 390, width: 180, height: 18 });
+
+  const ctx = doc.context;
+  const note = ctx.obj({
+    Type: "Annot",
+    Subtype: "Text",
+    Rect: [300, 700, 322, 722],
+    Contents: PDFString.of("Call (415) 555-2671"),
+    Name: "Comment",
+    F: 4,
+  });
+  const highlight = ctx.obj({
+    Type: "Annot",
+    Subtype: "Highlight",
+    Rect: [72, 330, 210, 346],
+    QuadPoints: [72, 346, 210, 346, 72, 330, 210, 330],
+    Contents: PDFString.of("See the attachment"),
+    C: [0.7, 0.7, 0.7],
+  });
+  const link = ctx.obj({
+    Type: "Annot",
+    Subtype: "Link",
+    Rect: [72, 300, 260, 318],
+    Border: [0, 0, 0],
+    A: { Type: "Action", S: "URI", URI: PDFString.of("https://example.com/track?id=ada") },
+  });
+  const csv = ctx.stream("item,amount\n", { Type: "EmbeddedFile", Subtype: "text/csv" });
+  const csvRef = ctx.register(csv);
+  const spec = ctx.obj({
+    Type: "Filespec",
+    F: PDFString.of("budget.csv"),
+    EF: { F: csvRef },
+  });
+  const specRef = ctx.register(spec);
+  const fileAnnot = ctx.obj({
+    Type: "Annot",
+    Subtype: "FileAttachment",
+    Rect: [340, 700, 362, 722],
+    FS: specRef,
+    Contents: PDFString.of("budget.csv"),
+    F: 4,
+  });
+  page.node.addAnnot(ctx.register(note));
+  page.node.addAnnot(ctx.register(highlight));
+  page.node.addAnnot(ctx.register(link));
+  page.node.addAnnot(ctx.register(fileAnnot));
+
+  const sig = ctx.obj({
+    Type: "Sig",
+    Filter: "Adobe.PPKLite",
+    SubFilter: "adbe.pkcs7.detached",
+    Name: PDFString.of("Ada Lovelace"),
+    M: PDFString.of("D:20260115120000Z"),
+    Reason: PDFString.of("Approval"),
+    Contents: PDFHexString.of("00"),
+    ByteRange: [0, 0, 0, 0],
+  });
+  const sigRef = ctx.register(sig);
+  const widget = ctx.obj({
+    Type: "Annot",
+    Subtype: "Widget",
+    FT: "Sig",
+    T: PDFString.of("Signature"),
+    V: sigRef,
+    Rect: [380, 36, 560, 78],
+    P: page.ref,
+    F: 4,
+  });
+  const widgetRef = ctx.register(widget);
+  const acro = doc.catalog.lookup(PDFName.of("AcroForm"));
+  if (acro instanceof PDFDict) {
+    const fields = acro.lookup(PDFName.of("Fields"));
+    if (fields instanceof PDFArray) fields.push(widgetRef);
+  }
+  page.node.addAnnot(widgetRef);
+
+  const page2 = doc.addPage([612, 792]);
+  page2.drawText("Notes for the board.", { x: 72, y: 700, size: 14, font, color: rgb(0, 0, 0) });
+
+  doc.setTitle("Confidential memo");
+  doc.setAuthor("Ada Lovelace");
+  doc.setSubject("Internal");
+  doc.setKeywords(["payroll"]);
+  doc.setCreator("Leaky Creator");
+  doc.setProducer("Leaky Producer");
+  stamp(doc);
+  const xmp = `<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about=""><dc:title>Confidential memo</dc:title><dc:creator>Ada Lovelace</dc:creator></rdf:Description></rdf:RDF></x:xmpmeta>
+<?xpacket end="w"?>`;
+  const meta = ctx.stream(xmp, { Type: "Metadata", Subtype: "XML" });
+  doc.catalog.set(PDFName.of("Metadata"), ctx.register(meta));
+
+  await doc.attach(new TextEncoder().encode("payroll notes ada@example.com"), "notes.txt", { mimeType: "text/plain" });
+  doc.addJavaScript("boot", 'var key = "AKIAIOSFODNN7EXAMPLE";');
+  const open = ctx.obj({
+    Type: "Action",
+    S: "JavaScript",
+    JS: PDFHexString.fromText("app.alert('opened');"),
+  });
+  doc.catalog.set(PDFName.of("OpenAction"), ctx.register(open));
+
+  const ocg = ctx.obj({
+    Type: "OCG",
+    Name: PDFString.of("Hidden notes"),
+    Usage: { View: { ViewState: "OFF" } },
+  });
+  const ocgRef = ctx.register(ocg);
+  doc.catalog.set(PDFName.of("OCProperties"), ctx.obj({ OCGs: [ocgRef], D: { OFF: [ocgRef], Order: [ocgRef] } }));
+
+  const saved = await doc.save({ useObjectStreams: false });
+  return appendRevision(saved);
 }
