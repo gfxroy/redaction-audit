@@ -1,6 +1,7 @@
 import { AnnotationMode, type PDFDocumentProxy } from "pdfjs-dist";
-import type { Cover, PageAudit } from "./lib/types";
 import type { RasterRequest } from "./lib/fix";
+import { rectToPoly } from "./lib/geometry";
+import type { Cover, Rect } from "./lib/types";
 
 export interface Thumbnail {
   page: number;
@@ -77,10 +78,10 @@ function burn(
   paintPolygon(ctx, viewport, cover.polygon, cover.kind === "white" ? "#ffffff" : "#000000");
 }
 
-/** Preview for a page that has leaks. Annotation covers are filled so a box with no appearance still shows. */
-export async function renderThumbnail(doc: PDFDocumentProxy, audit: PageAudit): Promise<Thumbnail | null> {
-  if (!audit.leaks.length) return null;
-  const page = await doc.getPage(audit.page);
+/** Page preview with problem areas outlined. The marks are not filled in. */
+export async function renderThumbnail(doc: PDFDocumentProxy, pageNumber: number, rects: Rect[]): Promise<Thumbnail | null> {
+  if (!rects.length) return null;
+  const page = await doc.getPage(pageNumber);
   const base = page.getViewport({ scale: 1 });
   const scale = (520 / base.width) * Math.min(2, window.devicePixelRatio || 1);
   const viewport = page.getViewport({ scale });
@@ -92,16 +93,13 @@ export async function renderThumbnail(doc: PDFDocumentProxy, audit: PageAudit): 
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   await page.render({ canvas, viewport, annotationMode: AnnotationMode.DISABLE }).promise;
-  for (const cover of audit.covers) {
-    if (cover.kind === "annotation") paintPolygon(ctx, viewport, cover.polygon, "#000000");
-  }
   const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
   if (!blob) return null;
   return {
-    page: audit.page,
+    page: pageNumber,
     url: URL.createObjectURL(blob),
     width: canvas.width,
     height: canvas.height,
-    outlines: audit.leaks.map((leak) => outline(viewport, leak.polygon)),
+    outlines: rects.map((rect) => outline(viewport, rectToPoly(rect))),
   };
 }

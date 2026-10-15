@@ -1,30 +1,42 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type DragEvent as ReactDragEvent } from "react";
 import type { PDFDocumentProxy } from "pdfjs-dist";
-import { auditDocument } from "./lib/audit";
-import { fixPdf } from "./lib/fix";
-import type { AuditReport, CoverKind, Leak } from "./lib/types";
+import { cleanPdf, DEFAULT_TOGGLES, type CleanToggles } from "./lib/clean";
+import { cleanSummary, type Finding, type Severity } from "./lib/findings";
+import { scanDocument, type ScanReport } from "./lib/scan";
+import { zipStore } from "./lib/zip";
 import { openPdf } from "./pdfjs";
 import { rasterizePage, renderThumbnail, type Thumbnail } from "./raster";
+
+interface Checked {
+  id: string;
+  name: string;
+  bytes: Uint8Array;
+  report: ScanReport | null;
+  thumbs: Thumbnail[];
+  error?: string;
+  summary?: string;
+}
 
 type Phase =
   | { status: "empty" }
   | { status: "busy"; message: string }
   | { status: "error"; message: string }
-  | { status: "ready"; name: string; report: AuditReport; thumbs: Thumbnail[] }
-  | { status: "fixing"; name: string; report: AuditReport; thumbs: Thumbnail[] }
-  | { status: "fixed"; name: string; report: AuditReport; thumbs: Thumbnail[]; verified: boolean; url: string; downloadName: string };
+  | { status: "files"; files: Checked[]; active: number | null; cleaning: boolean; note?: string };
 
-function headline(count: number) {
-  if (count === 0) return "No leaks found";
-  if (count === 1) return "1 redaction leaks text";
-  return `${count} redactions leak text`;
-}
+const GROUPS: { severity: Severity; label: string }[] = [
+  { severity: "high", label: "High" },
+  { severity: "medium", label: "Medium" },
+  { severity: "low", label: "Low" },
+];
 
-function kindLabel(kind: CoverKind) {
-  if (kind === "white") return "White box";
-  if (kind === "annotation") return "Annotation";
-  return "Black box";
-}
+const TOGGLE_COPY: { key: keyof CleanToggles; label: string }[] = [
+  { key: "burnRedactions", label: "Burn black boxes into the page" },
+  { key: "stripMetadata", label: "Remove author and other file info" },
+  { key: "removeAttachments", label: "Remove attached files" },
+  { key: "removeScripts", label: "Remove scripts" },
+  { key: "removeAnnotations", label: "Remove comments and highlights" },
+  { key: "flattenForms", label: "Clear form answers" },
+];
 
 function readError(err: unknown) {
   const name = err && typeof err === "object" && "name" in err ? String((err as { name: unknown }).name) : "";
@@ -33,153 +45,277 @@ function readError(err: unknown) {
   return "Could not read this PDF.";
 }
 
-function fixedName(name: string) {
-  return `${name.replace(/\.pdf$/i, "")}.fixed.pdf`;
+function cleanedName(name: string) {
+  return `${name.replace(/\.pdf$/i, "")}.cleaned.pdf`;
 }
 
-function leaksOn(report: AuditReport, page: number): Leak[] {
-  return report.leaks.filter((leak) => leak.page === page);
+function earlierName(name: string, index: number, total: number) {
+  const stem = name.replace(/\.pdf$/i, "");
+  return total > 1 ? `${stem}.earlier-${index + 1}.pdf` : `${stem}.earlier.pdf`;
+}
+
+function saveBytes(bytes: Uint8Array, filename: string, type: string) {
+  const copy = new Uint8Array(bytes);
+  const url = URL.createObjectURL(new Blob([copy], { type }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  return url;
+}
+
+function rectsByPage(report: ScanReport) {
+  const pages = new Map<number, NonNullable<Finding["rect"]>[]>();
+  for (const item of report.findings) {
+    if (!item.page || !item.rect) continue;
+    const list = pages.get(item.page) ?? [];
+    list.push(item.rect);
+    pages.set(item.page, list);
+  }
+  return pages;
 }
 
 export default function App() {
   const [phase, setPhase] = useState<Phase>({ status: "empty" });
+  const [toggles, setToggles] = useState<CleanToggles>(DEFAULT_TOGGLES);
   const [hot, setHot] = useState(false);
   const seq = useRef(0);
-  const docRef = useRef<PDFDocumentProxy | null>(null);
-  const bytesRef = useRef<Uint8Array | null>(null);
-  const urlsRef = useRef<string[]>([]);
+  const docs = useRef(new Map<string, PDFDocumentProxy>());
+  const urls = useRef<string[]>([]);
   const dragDepth = useRef(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const releaseUrls = () => {
-    for (const url of urlsRef.current) URL.revokeObjectURL(url);
-    urlsRef.current = [];
+    for (const url of urls.current) URL.revokeObjectURL(url);
+    urls.current.length = 0;
+  };
+
+  const destroyDocs = async () => {
+    const pending = [...docs.current.values()].map((doc) => doc.destroy().catch(() => undefined));
+    docs.current.clear();
+    await Promise.all(pending);
   };
 
   useEffect(() => {
-    const stop = (event: DragEvent) => event.preventDefault();
+    const liveDocs = docs.current;
+    const liveUrls = urls.current;
+    const stop = (event: Event) => event.preventDefault();
     window.addEventListener("dragover", stop);
     window.addEventListener("drop", stop);
     return () => {
       window.removeEventListener("dragover", stop);
       window.removeEventListener("drop", stop);
-      void docRef.current?.destroy();
-      for (const url of urlsRef.current) URL.revokeObjectURL(url);
+      for (const url of liveUrls) URL.revokeObjectURL(url);
+      for (const doc of liveDocs.values()) void doc.destroy().catch(() => undefined);
     };
   }, []);
 
-  const openBytes = async (bytes: Uint8Array, name: string, id = ++seq.current) => {
-    setPhase({ status: "busy", message: "Reading the PDF." });
-    setHot(false);
-    await docRef.current?.destroy().catch(() => undefined);
-    if (id !== seq.current) return;
-    docRef.current = null;
-    bytesRef.current = null;
-    releaseUrls();
+  const remember = (url: string) => {
+    urls.current.push(url);
+    return url;
+  };
+
+  const inspect = async (bytes: Uint8Array, name: string): Promise<Checked> => {
+    const id = crypto.randomUUID();
+    const doc = await openPdf(bytes);
+    docs.current.set(id, doc);
     try {
-      const doc = await openPdf(bytes);
-      if (id !== seq.current) {
-        await doc.destroy();
-        return;
-      }
-      const report = await auditDocument(doc);
-      if (id !== seq.current) {
-        await doc.destroy();
-        return;
-      }
+      const report = await scanDocument(bytes, doc);
       const thumbs: Thumbnail[] = [];
-      for (const page of report.pages) {
-        if (!page.leaks.length) continue;
-        const thumb = await renderThumbnail(doc, page);
-        if (id !== seq.current) {
-          if (thumb) URL.revokeObjectURL(thumb.url);
-          await doc.destroy();
-          return;
+      for (const [page, rects] of rectsByPage(report)) {
+        const thumb = await renderThumbnail(doc, page, rects);
+        if (thumb) {
+          remember(thumb.url);
+          thumbs.push(thumb);
         }
-        if (thumb) thumbs.push(thumb);
       }
-      docRef.current = doc;
-      bytesRef.current = bytes;
-      urlsRef.current = thumbs.map((thumb) => thumb.url);
-      setPhase({ status: "ready", name, report, thumbs });
+      return { id, name, bytes, report, thumbs };
     } catch (err) {
-      if (id !== seq.current) return;
-      setPhase({ status: "error", message: readError(err) });
+      docs.current.delete(id);
+      await doc.destroy().catch(() => undefined);
+      throw err;
     }
   };
 
-  const take = (file: File) => {
-    void file.arrayBuffer().then((buf) => openBytes(new Uint8Array(buf), file.name || "document.pdf"));
+  const openList = async (list: File[]) => {
+    if (!list.length) return;
+    const id = ++seq.current;
+    setPhase({
+      status: "busy",
+      message: list.length > 1 ? "Reading the files. This stays on your computer." : "Reading the file. This stays on your computer.",
+    });
+    setHot(false);
+    releaseUrls();
+    await destroyDocs();
+    if (id !== seq.current) return;
+    const files: Checked[] = [];
+    for (const file of list) {
+      if (id !== seq.current) return;
+      const name = file.name || "document.pdf";
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        if (id !== seq.current) return;
+        files.push(await inspect(bytes, name));
+      } catch (err) {
+        files.push({
+          id: crypto.randomUUID(),
+          name,
+          bytes: new Uint8Array(),
+          report: null,
+          thumbs: [],
+          error: readError(err),
+        });
+      }
+    }
+    if (id !== seq.current) return;
+    if (files.length === 1 && files[0]?.error) {
+      setPhase({ status: "error", message: files[0].error });
+      return;
+    }
+    setPhase({ status: "files", files, active: files.length === 1 ? 0 : null, cleaning: false });
   };
 
-  const loadSample = async (which: "bad" | "clean") => {
-    const name = which === "bad" ? "bad-redaction.pdf" : "clean-redaction.pdf";
+  const loadSample = async () => {
     const id = ++seq.current;
-    setPhase({ status: "busy", message: "Reading the PDF." });
+    setPhase({ status: "busy", message: "Reading the file. This stays on your computer." });
+    releaseUrls();
+    await destroyDocs();
+    if (id !== seq.current) return;
     try {
-      const res = await fetch(`${import.meta.env.BASE_URL}samples/${name}`);
+      const res = await fetch(`${import.meta.env.BASE_URL}samples/privacy-check.pdf`);
       if (!res.ok) throw new Error("sample");
       const bytes = new Uint8Array(await res.arrayBuffer());
       if (id !== seq.current) return;
-      await openBytes(bytes, name, id);
-    } catch {
+      const file = await inspect(bytes, "privacy-check.pdf");
       if (id !== seq.current) return;
-      setPhase({ status: "error", message: "Could not load the sample." });
+      setPhase({ status: "files", files: [file], active: 0, cleaning: false });
+    } catch (err) {
+      if (id !== seq.current) return;
+      const failedFetch = err instanceof Error && err.message === "sample";
+      setPhase({ status: "error", message: failedFetch ? "Could not load the sample." : readError(err) });
     }
   };
 
-  const fix = async () => {
-    if (phase.status !== "ready" || !docRef.current || !bytesRef.current) return;
-    const id = ++seq.current;
-    const doc = docRef.current;
-    const bytes = bytesRef.current;
-    const { name, report, thumbs } = phase;
-    setPhase({ status: "fixing", name, report, thumbs });
-    try {
-      const fixed = await fixPdf({
-        source: bytes,
-        report,
-        rasterize: (request) => rasterizePage(doc, request),
-      });
-      await doc.destroy();
-      if (docRef.current === doc) docRef.current = null;
-      if (id !== seq.current) return;
-      const check = await openPdf(fixed);
-      let verified = false;
-      try {
-        const again = await auditDocument(check);
-        verified = again.leakCount === 0;
-      } finally {
-        await check.destroy();
+  const replaceFile = (files: Checked[], index: number, next: Checked) => files.map((file, i) => (i === index ? next : file));
+
+  const cleanAt = async (files: Checked[], index: number) => {
+    const file = files[index];
+    if (!file?.report) return file;
+    const doc = docs.current.get(file.id);
+    if (!doc) return file;
+    const before = file.report.score;
+    const cleaned = await cleanPdf({
+      source: file.bytes,
+      report: file.report.audit,
+      rasterize: (request) => rasterizePage(doc, request),
+      toggles,
+    });
+    await doc.destroy().catch(() => undefined);
+    docs.current.delete(file.id);
+    for (const thumb of file.thumbs) URL.revokeObjectURL(thumb.url);
+    const nextDoc = await openPdf(cleaned);
+    docs.current.set(file.id, nextDoc);
+    const report = await scanDocument(cleaned, nextDoc);
+    const thumbs: Thumbnail[] = [];
+    for (const [page, rects] of rectsByPage(report)) {
+      const thumb = await renderThumbnail(nextDoc, page, rects);
+      if (thumb) {
+        remember(thumb.url);
+        thumbs.push(thumb);
       }
+    }
+    return {
+      ...file,
+      bytes: cleaned,
+      report,
+      thumbs,
+      summary: cleanSummary(before, report.score),
+      error: undefined,
+    };
+  };
+
+  const cleanActive = async () => {
+    if (phase.status !== "files" || phase.active === null || phase.cleaning) return;
+    const index = phase.active;
+    const id = seq.current;
+    setPhase({ ...phase, cleaning: true, note: "Building a cleaner copy. This stays on your computer." });
+    try {
+      const next = await cleanAt(phase.files, index);
+      if (!next || id !== seq.current) return;
+      const bytes = next.bytes;
+      const url = saveBytes(bytes, cleanedName(next.name), "application/pdf");
+      remember(url);
       if (id !== seq.current) return;
-      const url = URL.createObjectURL(new Blob([fixed.slice().buffer], { type: "application/pdf" }));
-      urlsRef.current.push(url);
       setPhase({
-        status: "fixed",
-        name,
-        report,
-        thumbs,
-        verified,
-        url,
-        downloadName: fixedName(name),
+        status: "files",
+        files: replaceFile(phase.files, index, next),
+        active: index,
+        cleaning: false,
       });
     } catch {
       if (id !== seq.current) return;
-      setPhase({ status: "error", message: "Could not build the fixed PDF." });
+      setPhase({ ...phase, cleaning: false, note: "Could not build the cleaned PDF." });
     }
   };
 
-  const report = phase.status === "ready" || phase.status === "fixing" || phase.status === "fixed" ? phase.report : null;
-  const thumbs = phase.status === "ready" || phase.status === "fixing" || phase.status === "fixed" ? phase.thumbs : [];
-  const showDrop = !report;
+  const cleanAll = async () => {
+    if (phase.status !== "files" || phase.cleaning) return;
+    const id = seq.current;
+    const start = phase.files;
+    setPhase({ ...phase, cleaning: true, note: "Building cleaner copies. This stays on your computer." });
+    const nextFiles = [...start];
+    const packed: { name: string; bytes: Uint8Array }[] = [];
+    try {
+      for (let index = 0; index < start.length; index++) {
+        if (id !== seq.current) return;
+        if (!start[index]?.report) continue;
+        const next = await cleanAt(nextFiles, index);
+        if (!next || id !== seq.current) return;
+        nextFiles[index] = next;
+        packed.push({ name: cleanedName(next.name), bytes: next.bytes });
+      }
+      if (!packed.length) throw new Error("empty");
+      const zip = zipStore(packed);
+      const url = saveBytes(zip, "cleaned-pdfs.zip", "application/zip");
+      remember(url);
+      if (id !== seq.current) return;
+      setPhase({ status: "files", files: nextFiles, active: phase.active, cleaning: false, note: "Cleaned copies are in the download." });
+    } catch {
+      if (id !== seq.current) return;
+      setPhase({ status: "files", files: nextFiles, active: phase.active, cleaning: false, note: "Could not build the cleaned PDF." });
+    }
+  };
+
+  const files = phase.status === "files" ? phase.files : [];
+  const active = phase.status === "files" && phase.active !== null ? phase.files[phase.active] : undefined;
+  const showList = phase.status === "files" && files.length > 1 && phase.active === null;
+
+  const onDrop = (event: ReactDragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    dragDepth.current = 0;
+    setHot(false);
+    const dropped = [...event.dataTransfer.files];
+    if (dropped.length) void openList(dropped);
+  };
 
   return (
     <main className="wrap">
       <header>
-        <p className="brand">Redaction Audit</p>
-        <h1>{report ? headline(report.leakCount) : "Drop a PDF."}</h1>
-        <p className="lede">See if its black boxes actually hide anything — and fix them for real.</p>
+        <p className="brand">PDF Privacy Check</p>
+        {active?.report ? (
+          <>
+            <p className="score" aria-label={`Score ${active.report.score.letter}`}>{active.report.score.letter}</p>
+            <h1 className="sentence">{active.summary ?? active.report.score.sentence}</h1>
+            <p className="file-name">{active.name}</p>
+          </>
+        ) : (
+          <>
+            <h1>Find what your PDF is secretly leaking.</h1>
+            <p className="lede">Black boxes, hidden text, and old saves can still be in the file. This check reads it here and can hand you a cleaner copy.</p>
+          </>
+        )}
       </header>
 
       <input
@@ -188,126 +324,163 @@ export default function App() {
         className="file"
         type="file"
         accept="application/pdf,.pdf"
+        multiple
         onChange={(event) => {
-          const file = event.target.files?.[0];
+          const chosen = [...(event.target.files ?? [])];
           event.target.value = "";
-          if (file) take(file);
+          if (chosen.length) void openList(chosen);
         }}
       />
 
-      {showDrop && (
-        <label
-          htmlFor="pdf-file"
-          className={hot ? "drop hot" : "drop"}
-          onDragEnter={(event) => {
-            event.preventDefault();
-            dragDepth.current += 1;
-            setHot(true);
-          }}
-          onDragLeave={() => {
-            dragDepth.current -= 1;
-            if (dragDepth.current <= 0) {
-              dragDepth.current = 0;
-              setHot(false);
-            }
-          }}
-          onDrop={(event) => {
-            event.preventDefault();
+      <label
+        htmlFor="pdf-file"
+        className={hot ? `drop hot${files.length ? " compact" : ""}` : `drop${files.length ? " compact" : ""}`}
+        onDragEnter={(event) => {
+          event.preventDefault();
+          dragDepth.current += 1;
+          setHot(true);
+        }}
+        onDragLeave={() => {
+          dragDepth.current -= 1;
+          if (dragDepth.current <= 0) {
             dragDepth.current = 0;
             setHot(false);
-            const file = event.dataTransfer.files[0];
-            if (file) take(file);
-          }}
-        >
-          <span className="drop-title">Drop a PDF</span>
-          <span className="drop-hint">or choose a file</span>
-        </label>
-      )}
+          }
+        }}
+        onDrop={onDrop}
+      >
+        <span className="drop-title">{files.length ? "Drop another PDF" : "Drop a PDF"}</span>
+        <span className="drop-hint">or choose files</span>
+      </label>
 
       <div className="links">
-        <button type="button" className="link" onClick={() => void loadSample("bad")}>
-          Try a sample
-        </button>
-        <button type="button" className="link" onClick={() => void loadSample("clean")}>
-          Try a clean file
-        </button>
-        {report && (
-          <button type="button" className="link" onClick={() => inputRef.current?.click()}>
-            Choose another file
-          </button>
+        <button type="button" className="link" onClick={() => void loadSample()}>Try a sample</button>
+        {files.length > 1 && phase.status === "files" && phase.active !== null && (
+          <button type="button" className="link" onClick={() => setPhase({ ...phase, active: null, note: undefined })}>All files</button>
         )}
       </div>
 
-      {phase.status === "busy" && <p className="status">{phase.message}</p>}
-      {phase.status === "error" && <p className="status">{phase.message}</p>}
+      {phase.status === "busy" && <p className="status" role="status">{phase.message}</p>}
+      {phase.status === "error" && <p className="status error" role="alert">{phase.message}</p>}
+      {phase.status === "files" && phase.note && <p className="status" role="status">{phase.note}</p>}
 
-      {report && (
+      {showList && phase.status === "files" && (
+        <section>
+          <ul className="batch">
+            {files.map((file, index) => (
+              <li key={file.id}>
+                <button type="button" onClick={() => setPhase({ ...phase, active: index })}>
+                  <span className="name">{file.name}</span>
+                  <span className="grade">{file.report?.score.letter ?? "–"}</span>
+                </button>
+                <p>{file.error ?? file.summary ?? file.report?.score.sentence}</p>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {active?.error && <p className="status error" role="alert">{active.error}</p>}
+
+      {active?.report && (
         <section aria-live="polite">
-          {(phase.status === "ready" || phase.status === "fixing" || phase.status === "fixed") && (
-            <p className="file-name">{phase.name}</p>
+          {active.thumbs.length > 0 && (
+            <div className="pages">
+              {active.thumbs.map((thumb) => (
+                <article key={thumb.page}>
+                  <h2 className="page-label">Page {thumb.page}</h2>
+                  <div className="thumb">
+                    <img src={thumb.url} alt="" width={thumb.width} height={thumb.height} />
+                    <svg viewBox={`0 0 ${thumb.width} ${thumb.height}`} aria-hidden="true">
+                      {thumb.outlines.map((points, index) => (
+                        <polygon key={index} points={points} />
+                      ))}
+                    </svg>
+                  </div>
+                </article>
+              ))}
+            </div>
           )}
-          {report.leakCount === 0 && <p className="status">Nothing hidden under a box was recovered.</p>}
-          <div className="pages">
-            {report.pages.filter((page) => page.leaks.length > 0).map((page) => {
-              const thumb = thumbs.find((item) => item.page === page.page);
+          <div className="groups">
+            {GROUPS.map((group) => {
+              const items = active.report!.findings.filter((item) => item.severity === group.severity);
+              if (!items.length) return null;
               return (
-                <article className="page" key={page.page}>
-                  <h2>Page {page.page}</h2>
-                  {thumb && (
-                    <div className="thumb">
-                      <img src={thumb.url} alt="" width={thumb.width} height={thumb.height} />
-                      <svg viewBox={`0 0 ${thumb.width} ${thumb.height}`} aria-hidden="true">
-                        {thumb.outlines.map((points, index) => (
-                          <polygon key={index} points={points} />
+                <section key={group.severity}>
+                  <h2>{group.label}</h2>
+                  <ul className="cards">
+                    {items.map((item) => (
+                      <li key={item.id}>
+                        <h3>{item.title}</h3>
+                        <p className="why">{item.why}</p>
+                        {item.page && <p className="where">Page {item.page}</p>}
+                        <details>
+                          <summary>Details</summary>
+                          <p className="mono">{item.detail}</p>
+                        </details>
+                        {item.kind === "revision" && active.report!.revisions.map((revision, index) => (
+                          <button
+                            key={revision.label}
+                            type="button"
+                            className="link"
+                            onClick={() => remember(saveBytes(revision.bytes, earlierName(active.name, index, active.report!.revisions.length), "application/pdf"))}
+                          >
+                            Download earlier version
+                          </button>
                         ))}
-                      </svg>
-                    </div>
-                  )}
-                  <ul className="leaks">
-                    {leaksOn(report, page.page).map((leak, index) => (
-                      <li key={`${leak.kind}-${index}`}>
-                        <code>{leak.text}</code>
-                        <span className="kind">{kindLabel(leak.kind)}</span>
                       </li>
                     ))}
                   </ul>
-                </article>
+                </section>
               );
             })}
           </div>
         </section>
       )}
 
-      {phase.status === "ready" && phase.report.leakCount > 0 && (
+      {active?.report && (
         <div className="actions">
-          <button type="button" className="primary" onClick={() => void fix()}>
-            Fix
+          <fieldset className="toggles">
+            <legend>What to remove</legend>
+            {TOGGLE_COPY.map((toggle) => (
+              <label key={toggle.key}>
+                <input
+                  type="checkbox"
+                  checked={toggles[toggle.key]}
+                  onChange={(event) => setToggles({ ...toggles, [toggle.key]: event.target.checked })}
+                />
+                <span>{toggle.label}</span>
+              </label>
+            ))}
+          </fieldset>
+          <button type="button" className="primary" onClick={() => void cleanActive()} disabled={phase.status === "files" && phase.cleaning}>
+            {phase.status === "files" && phase.cleaning ? "Cleaning…" : "Clean & download"}
           </button>
         </div>
       )}
 
-      {phase.status === "fixing" && (
+      {showList && (
         <div className="actions">
-          <button type="button" className="primary" disabled>
-            Fixing…
+          <fieldset className="toggles">
+            <legend>What to remove</legend>
+            {TOGGLE_COPY.map((toggle) => (
+              <label key={toggle.key}>
+                <input
+                  type="checkbox"
+                  checked={toggles[toggle.key]}
+                  onChange={(event) => setToggles({ ...toggles, [toggle.key]: event.target.checked })}
+                />
+                <span>{toggle.label}</span>
+              </label>
+            ))}
+          </fieldset>
+          <button type="button" className="primary" onClick={() => void cleanAll()} disabled={phase.status === "files" && phase.cleaning}>
+            {phase.status === "files" && phase.cleaning ? "Cleaning…" : "Clean & download all"}
           </button>
         </div>
       )}
 
-      {phase.status === "fixed" && (
-        <div className="actions">
-          <p className="verified">
-            {phase.verified ? "Verified. No leaked text remains." : "The fixed file still has leaked text."}
-          </p>
-          {phase.verified && (
-            <a className="primary" href={phase.url} download={phase.downloadName}>
-              Download {phase.downloadName}
-            </a>
-          )}
-        </div>
-      )}
-
-      <footer>The file stays in this tab. Nothing is uploaded.</footer>
+      <footer>Your files never leave this tab.</footer>
     </main>
   );
 }
