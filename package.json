@@ -2,7 +2,7 @@
   "name": "redaction-audit",
   "private": true,
   "version": "1.0.0",
-  "description": "Drop a PDF. See if its black boxes actually hide anything — and fix them for real.",
+  "description": "Find what a PDF is secretly leaking, then download a cleaner copy. The file stays in the tab.",
   "type": "module",
   "license": "MIT",
   "scripts": {
