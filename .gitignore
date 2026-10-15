@@ -6,3 +6,4 @@ coverage
 .DS_Store
 tsconfig.tsbuildinfo
 node_modules/.tmp
+SPEC.md
